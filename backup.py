@@ -2,18 +2,13 @@ from pathlib import Path
 import shutil
 import getpass
 import os
-import tarfile
 import datetime
 import sys
 import argparse
 import zipfile
+import tempfile
+import stat
 
-def zipdir(path, ziph):
-    for root, dirs, files in os.walk(path):
-        for file in files:
-            ziph.write(os.path.join(root, file), 
-                       os.path.relpath(os.path.join(root, file), 
-                                     os.path.join(path, '..')))
 # Optionales Paket für den Papierkorb (send2trash) laden, falls vorhanden
 try:
     import send2trash
@@ -21,34 +16,87 @@ try:
 except ImportError:
     HAS_SEND2TRASH = False
 
-try:
-    shutil.rmtree("tmp", ignore_errors=True)
-except:
-    pass
-
 def remove_readonly(func, path, excinfo):
-    import stat
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception as e:
+        print(f"-> Konnte Schreibschutz nicht entfernen für {path}: {e}")
 
 def safe_delete(path_to_delete):
-    """Verschiebt eine Datei oder einen Ordner sicher in den Papierkorb (via send2trash) 
-    oder nutzt shutil als Fallback, falls das Paket nicht installiert ist."""
+    p = Path(path_to_delete)
+    if not p.exists():
+        return
     try:
+        # Vorab immer den Schreibschutz erzwingen, damit Windows das Löschen nicht blockiert
+        if p.is_file() or p.is_symlink():
+            os.chmod(p, stat.S_IWRITE)
+        
         if HAS_SEND2TRASH:
-            send2trash.send2trash(str(path_to_delete))
+            try:
+                send2trash.send2trash(str(p))
+                return
+            except Exception:
+                # Fallback auf normales Löschen, falls send2trash fehlschlägt
+                pass
+
+        if p.is_dir():
+            shutil.rmtree(p, onerror=remove_readonly)
         else:
-            import stat
-            def onerror(func, p, exc):
-                os.chmod(p, stat.S_IWRITE)
-                func(p)
-            if Path(path_to_delete).is_dir():
-                shutil.rmtree(path_to_delete, onerror=onerror)
-            else:
-                os.chmod(path_to_delete, stat.S_IWRITE)
-                os.remove(path_to_delete)
+            p.unlink()
     except Exception as e:
-            print(f"-> Warnung: Konnte '{path_to_delete.name}' nicht in den Papierkorb verschieben: {e}")
+        print(f"-> Fehler beim Löschen von '{p.name}': {e}")
+
+def robust_copy(src_dir, dst_dir):
+    """Kopiert Ordner robust Datei für Datei. Überspringt geschützte Dateien/Links."""
+    src_path = Path(src_dir)
+    dst_path = Path(dst_dir)
+    dst_path.mkdir(parents=True, exist_ok=True)
+    
+    script_dir = Path(__file__).resolve().parent.resolve()
+    copied_files = 0
+
+    for root, dirs, files in os.walk(src_dir):
+        root_p = Path(root).resolve()
+        
+        if script_dir in root_p.parents or root_p == script_dir:
+            continue
+            
+        try:
+            rel_path = root_p.relative_to(src_path)
+        except ValueError:
+            continue
+            
+        target_subdir = dst_path / rel_path
+        
+        try:
+            target_subdir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+
+        for file in files:
+            if file.lower() == "reco.recc":
+                continue
+
+            src_file = root_p / file
+            
+            try:
+                if src_file.is_symlink() or (src_file.is_dir() and src_file.lstat().st_file_attributes & 0x400):
+                    continue
+            except Exception:
+                pass
+
+            target_file = target_subdir / file
+            
+            try:
+                if not os.access(src_file, os.R_OK):
+                    continue
+                shutil.copy2(src_file, target_file)
+                copied_files += 1
+            except Exception:
+                pass
+                
+    return copied_files
 
 def run_backup(extra_input=None, interactive=False):
     if interactive:
@@ -57,7 +105,11 @@ def run_backup(extra_input=None, interactive=False):
         extra = extra_input.strip() if extra_input else ""
 
     script_dir = Path(__file__).resolve().parent
-    tmp_path = script_dir / "tmp"
+    
+    # Temporärer Ordner sicher im System-Temp anlegen, damit er nicht im Backup landet
+    tmp_path = Path(tempfile.gettempdir()) / "backup_sys_tmp"
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path, onerror=remove_readonly, ignore_errors=True)
     tmp_path.mkdir(parents=True, exist_ok=True)
 
     home = Path.home()
@@ -104,15 +156,7 @@ def run_backup(extra_input=None, interactive=False):
 
         print(f"Kopiere {ordner_name} ({quell_pfad})...")
         try:
-            def ignore_errors(dir, files):
-                ignored = []
-                for f in files:
-                    fp = os.path.join(dir, f)
-                    if not os.access(fp, os.R_OK):
-                        ignored.append(f)
-                return ignored
-
-            shutil.copytree(quell_pfad, ziel_pfad, dirs_exist_ok=True, ignore=ignore_errors)
+            anzahl = robust_copy(quell_pfad, ziel_pfad)
     
             reco_file = ziel_pfad / "reco.recc"
             quell_str = str(quell_pfad)
@@ -121,63 +165,36 @@ def run_backup(extra_input=None, interactive=False):
             with open(reco_file, "w", encoding="utf-8") as f:
                 f.write(f"qp:{quell_str_angepasst}")
                 
-            print(f"-> {ordner_name} erfolgreich gesichert.")
+            print(f"-> {ordner_name} erfolgreich gesichert ({anzahl} Dateien kopiert).")
         except Exception as e:
-            print(f"-> Fehler beim Kopieren von {ordner_name}: {e}")
-            reco_file = ziel_pfad / "reco.recc"
-            quell_str = str(quell_pfad)
-            quell_str_angepasst = quell_str.replace(cu, "{cu}")
+            print(f"-> Fehler beim Sichern von {ordner_name}: {e}")
 
-            with open(reco_file, "w", encoding="utf-8") as f:
-                f.write(f"qp:{quell_str_angepasst}")
-            print(" -> Recognisionfile created")
-    
     print("===========================================")
     print("==             Erstelle Archiv           ==")
     print("===========================================")
-    os.system("cls")
-
-    def size_format(b):
-        if b < 1000:
-                  return '%i' % b + 'B'
-        elif 1000 <= b < 1000000:
-            return '%.1f' % float(b/1000) + 'KB'
-        elif 1000000 <= b < 1000000000:
-            return '%.1f' % float(b/1000000) + 'MB'
-        elif 1000000000 <= b < 1000000000000:
-            return '%.1f' % float(b/1000000000) + 'GB'
-        elif 1000000000000 <= b:
-            return '%.1f' % float(b/1000000000000) + 'TB'
-
-    def get_size(start_path = '.'):
-        total_size = 0
-        for dirpath, dirnames, filenames in os.walk(start_path):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                # skip if it is symbolic link
-                if not os.path.islink(fp):
-                    total_size += os.path.getsize(fp)
-
-        return total_size
-
-    os.system("cls")
 
     archive_name = script_dir / 'backup_{date:%Y-%m-%d_%H-%M-%S}.zip'.format(date=datetime.datetime.now())
     print("Archive Name: ", archive_name.name)
     
     print()
+    total_zipped = 0
     with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        zipdir(str(tmp_path), zipf)
-    
+        for file_path in tmp_path.rglob('*'):
+            if file_path.is_file():
+                arcname = file_path.relative_to(tmp_path)
+                zipf.write(file_path, arcname)
+                total_zipped += 1
+
+    print(f"-> Archiv erfolgreich erstellt ({total_zipped} Dateien im ZIP enthalten).")
     print("===========================================")
     print("==            Archiv Erstellt            ==")
     print("===========================================")
 
-    shutil.rmtree(tmp_path, onerror=remove_readonly)
+    shutil.rmtree(tmp_path, onerror=remove_readonly, ignore_errors=True)
 
 def run_restore(zip_filename=None):
     print("===========================================")
-    print("==       Starte Wiederherstellung        ==")
+    print("==        Starte Wiederherstellung       ==")
     print("===========================================")
 
     if not HAS_SEND2TRASH:
@@ -185,7 +202,7 @@ def run_restore(zip_filename=None):
         print("Um Dateien sicher in den Papierkorb zu verschieben, führe bitte aus:")
         print("pip install send2trash\n")
 
-    script_dir = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent.resolve()
     
     if zip_filename:
         selected_zip = script_dir / zip_filename
@@ -211,9 +228,10 @@ def run_restore(zip_filename=None):
             print("-> Ungültige Auswahl!")
             return
 
-    extract_tmp = script_dir / "restore_tmp"
+    # WICHTIG: r_tmp wird im Windows-Temp-Verzeichnis erstellt, damit das Skript sich nicht selbst löscht!
+    extract_tmp = Path(tempfile.gettempdir()) / "backup_sys_r_tmp"
     if extract_tmp.exists():
-        shutil.rmtree(extract_tmp, onerror=remove_readonly)
+        shutil.rmtree(extract_tmp, onerror=remove_readonly, ignore_errors=True)
     extract_tmp.mkdir(parents=True, exist_ok=True)
 
     print(f"Entpacke {selected_zip.name}...")
@@ -223,11 +241,11 @@ def run_restore(zip_filename=None):
     current_user = getpass.getuser().lower()
     print(f"Aktueller Benutzer für Wiederherstellung: {current_user}")
 
-    reco_dateien = list(extract_tmp.glob("**/reco.recc"))
+    reco_dateien = list(extract_tmp.rglob("reco.recc"))
     
     if not reco_dateien:
-        print("-> Keine Wiederherstellungsdateien (reco.recc) im Archiv gefunden.")
-        shutil.rmtree(extract_tmp, onerror=remove_readonly)
+        print("-> Keine gültigen Wiederherstellungsdateien (reco.recc) im Archiv gefunden.")
+        shutil.rmtree(extract_tmp, onerror=remove_readonly, ignore_errors=True)
         return
 
     for reco_file in reco_dateien:
@@ -241,59 +259,92 @@ def run_restore(zip_filename=None):
             if inhalt.startswith("qp:"):
                 pfad_template = inhalt.split("qp:")[1]
                 ziel_pfad_str = pfad_template.replace("{cu}", current_user)
-                ziel_pfad = Path(ziel_pfad_str)
+                ziel_pfad = Path(ziel_pfad_str).resolve()
 
-                print(f"Stelle '{ordner_name}' wieder her nach: {ziel_pfad}")
-                ziel_pfad.mkdir(parents=True, exist_ok=True)
+                if "Administrator" in str(ziel_pfad) and current_user != "administrator":
+                    ziel_pfad = Path(str(ziel_pfad).replace("C:\\Users\\Administrator", f"C:\\Users\\{getpass.getuser()}"))
+
+                print(f"\nStelle '{ordner_name}' wieder her nach: {ziel_pfad}")
+                
+                try:
+                    ziel_pfad.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+
+                if not ziel_pfad.exists():
+                    print(f"-> Warnung: Zielpfad konnte nicht erstellt werden: {ziel_pfad}")
+                    continue
 
                 backup_rel_pfad = set()
                 for item in backup_ordner.rglob("*"):
-                    if item.name == "reco.recc":
+                    if item.name.lower() == "reco.recc":
                         continue
                     backup_rel_pfad.add(item.relative_to(backup_ordner))
 
                 if ziel_pfad.exists():
                     for existing_item in sorted(ziel_pfad.rglob("*"), reverse=True):
-                        if existing_item.name == "reco.recc":
+                        if existing_item.name.lower() == "reco.recc":
                             continue
                         
+                        try:
+                            resolved_item = existing_item.resolve()
+                            
+                            # ABSOLUTER SELBSTSCHUTZ: 
+                            if script_dir in resolved_item.parents or resolved_item == script_dir:
+                                continue
+                        except Exception:
+                            pass
+                        
+                        try:
+                            if existing_item.is_symlink() or (existing_item.is_dir() and existing_item.lstat().st_file_attributes & 0x400):
+                                continue
+                        except Exception:
+                            pass
+
                         rel_path = existing_item.relative_to(ziel_pfad)
+                        if "backup-system" in str(rel_path):
+                            continue
                         if rel_path not in backup_rel_pfad:
-                            print(f"-> Verschiebe nicht im Backup enthaltene Datei/Ordner in den Papierkorb: {rel_path}")
+                            print(f"-> [Lösche / Papierkorb] Nicht im Backup enthalten: {rel_path}")
                             safe_delete(existing_item)
 
-                for item in backup_ordner.iterdir():
-                    if item.name == "reco.recc":
+                for item in backup_ordner.rglob("*"):
+                    if item.name.lower() == "reco.recc":
                         continue
                     
-                    target_item = ziel_pfad / item.name
+                    rel_path = item.relative_to(backup_ordner)
+                    target_item = ziel_pfad / rel_path
                     
-                    if item.name.lower() == "desktop.ini":
-                        if target_item.exists():
+                    if item.is_dir():
+                        target_item.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target_item.parent.mkdir(parents=True, exist_ok=True)
+                        if target_item.name.lower() == "desktop.ini" and target_item.exists():
                             try:
-                                import stat
                                 os.chmod(target_item, stat.S_IWRITE)
                             except Exception:
                                 pass
-
-                    if item.is_dir():
-                        shutil.copytree(item, target_item, dirs_exist_ok=True)
-                    else:
                         try:
                             shutil.copy2(item, target_item)
                         except PermissionError:
                             try:
-                                import stat
                                 os.chmod(target_item, stat.S_IWRITE)
                                 shutil.copy2(item, target_item)
                             except Exception as sub_e:
-                                print(f"-> Warnung: Konnte {item.name} nicht überschreiben ({sub_e})")
+                                if "desktop.ini" not in str(target_item).lower():
+                                    print(f"-> Warnung: Konnte {rel_path} nicht überschreiben ({sub_e})")
                         
+                ziel_reco = ziel_pfad / "reco.recc"
+                if ziel_reco.exists():
+                    safe_delete(ziel_reco)
+
                 print(f"-> {ordner_name} erfolgreich wiederhergestellt.")
         except Exception as e:
             print(f"-> Fehler bei der Wiederherstellung von {ordner_name}: {e}")
 
-    shutil.rmtree(extract_tmp, onerror=remove_readonly)
+    if extract_tmp.exists():
+        shutil.rmtree(extract_tmp, onerror=remove_readonly, ignore_errors=True)
+        
     print("===========================================")
     print("==      Wiederherstellung beendet        ==")
     print("===========================================")
@@ -302,11 +353,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Backup & Recovery Tool")
     subparsers = parser.add_subparsers(dest="command")
 
-    # Subparser für 'backup'
     parser_backup = subparsers.add_parser("backup", help="Erstellt ein Backup")
     parser_backup.add_argument("--extras", type=str, default=None, help="Zusätzliche Ordner, getrennt durch Komma")
 
-    # Subparser für 'restore'
     parser_restore = subparsers.add_parser("restore", help="Stellt ein Backup wieder her")
     parser_restore.add_argument("tarfile", nargs="?", default=None, help="Name der Backup-Archiv-Datei (optional)")
 
@@ -317,7 +366,7 @@ if __name__ == "__main__":
     elif args.command == "restore":
         if not args.tarfile:
             script_dir = Path(__file__).resolve().parent
-            tar_dateien = sorted(list(script_dir.glob("backup_*.tar.xz")) + list(script_dir.glob("backup_*.tar.gz")) + list(script_dir.glob("backup_*.zip")), key=os.path.getmtime, reverse=True)
+            tar_dateien = sorted(list(script_dir.glob("backup_*.zip")), key=os.path.getmtime, reverse=True)
             if tar_dateien:
                 args.tarfile = tar_dateien[0].name
                 print(f"-> Kein Dateiname angegeben. Nutze automatisch das neueste Backup: {args.tarfile}")
@@ -325,9 +374,8 @@ if __name__ == "__main__":
     else:
         os.system("title \"Backup & Recovery Tool\"")
         os.system("cls")
-        # Interaktiver Fallback, wenn das Skript ohne Parameter gestartet wird
         print("===========================================")
-        print("==       Backup & Recovery Tool          ==")
+        print("==        Backup & Recovery Tool         ==")
         print("===========================================")
         print(" [1] Backup erstellen")
         print(" [2] Wiederherstellen (Restore)")
